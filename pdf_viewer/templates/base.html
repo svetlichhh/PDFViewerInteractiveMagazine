@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+{% load static %}
+
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    {% block extrahead %}{% endblock extrahead %}
+    <title>{% block title %}{% endblock title %}</title>
+
+    {% comment %} bootstrap css {% endcomment %}
+    <link rel="stylesheet" href="{% static 'bootstrap\css\bootstrap.min.css' %}">
+
+    {% comment %} default css {% endcomment %}
+    <link rel="stylesheet" href="{% static 'css\base.css' %}">
+</head>
+<body>
+    <header class="header sticky-top">
+        <div class="header-container d-flex">
+            <navbar class="header-nav pt-4">
+                <ul class="header-list d-flex">
+                    <li>
+                        <a href="/" class="nav-a m-3">Home</a>
+                    </li>
+                    <li>
+                        <a href="{% url 'main:catalog' %}" class="nav-a m-3">Catalog</a>
+                    </li>
+                </ul>
+            </navbar>
+            <div class="header-logo">
+                <a href="/"><img src="/" alt="Main Page" class="picture-logo"></a>
+            </div>
+            <div class="header-profile">
+                <a href="#" class="m-3">Login</a>
+            </div>
+        </div>
+    </header>
+    <div class="container">
+        {% block content %}{% endblock content %}
+    </div>
+    {% comment %} bootstrap js {% endcomment %}
+    <script src="{% static 'bootstrap\js\bootstrap.bundle.min.js' %}"></script>
+</body>
+</html>

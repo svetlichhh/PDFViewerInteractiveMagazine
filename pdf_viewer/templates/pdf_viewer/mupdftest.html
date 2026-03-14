@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+{% load static %}
+<html lang="ru">
+
+<!--
+<script>
+    const worker = new Worker("{% static 'js/mupdf.js/worker.js' %}", { type: "module" });
+</script>
+-->
+
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="{% static 'js/pdf.js/web/pdf_viewer.css' %}">
+    <style>
+        body {
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+        }
+        #viewerContainer {
+            width: 870px;
+            height: 800px;
+            max-width: 100%; 
+            overflow: auto;
+            position: absolute;
+        }
+        #buttonViewerContainer {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            width: 100%;
+            height: 25px;
+            position: absolute;
+        }
+        #documentContainer {
+            width: 100%;
+            height: calc(100% - 25px);
+            top: 25px;
+            overflow-x: auto;
+            position: absolute;
+            background: #ccc;
+        }
+        .textLayer ::selection {
+            background: rgba(255, 255, 0, 0.3);
+        }
+        .comment {
+            width: 28px;
+            height: 28px;
+        }
+        .annotationEditorLayer .editToolbar .delete[hidden] {
+            display: none !important;
+        }
+    </style>
+</head>
+
+<body>
+
+<div id="viewerContainer">
+    <div id="buttonViewerContainer">
+        <button id="prev" type="button">Previous</button>
+        <button id="next" type="button">Next</button>
+        &nbsp; &nbsp;
+        <span>Page: <input id="pageNum" type="number" value="1"></span> / <span id="pageCount"></span></span>
+        &nbsp; &nbsp;
+        <button id="zoomIn" type="button">+</button>
+        <input id="scaleInput" type="number" value="100" step="1">
+        <button id="zoomOut" type="button">-</button>
+    </div>
+    <div id="documentContainer">
+        <div id="viewer" class="pdfViewer"></div>
+    </div>
+</div>
+
+<script id="script" type="module">
+    import * as pdfjsLib from "{% static 'js/pdf.js/node_modules/pdfjs-dist/build/pdf.mjs' %}";
+    import { PDFViewer, EventBus, PDFLinkService, MIN_SCALE, MAX_SCALE, DEFAULT_SCALE_DELTA } from '{% static "js/pdf.js/node_modules/pdfjs-dist/web/pdf_viewer.mjs" %}';
+    
+    var url = null;
+
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "{% static 'js/pdf.js/node_modules/pdfjs-dist/build/pdf.worker.mjs' %}";
+
+    // Функции, обработчики, DOM
+
+    window.addEventListener("DOMContentLoaded", () => {
+        sessionStorage.removeItem("previousScale");
+    })
+
+    let eventBus = null;
+    let pdfViewer = null;
+    let renderingQueue = null;
+    let pdfDoc = null;
+    let pdfLinkService = null;
+    let pagesInitEvent = false;
+    let pagesLoadEvent = false;
+    let pageIndex = null;
+    let numOfDocPages = 0;
+    let annotationUIManager = null;
+    let isMouseDown = false;
+    let quadPoints = null;
+    let rectSelectionObj = null;
+    let currentJSEditor = null;
+    let currentDeleteButton = null;
+    let currentHighlightColor = null;
+    let currentToolbar = null;
+
+    let observerFirstOpennedHighlightEditor = null;
+
+    let annotationsCache = [];
+    let myAnnotsCache = [];
+    let myUIManagersCache = [];
+    let currentUserId = window.AUTH_USER_ID ?? null;
+
+    function normalizeAnnotationIdentifier(value) {
+        if (value === null || value === undefined) {
+            return null;
+        }
+        let strValue = String(value).trim();
+        if (strValue.toLowerCase().endsWith('r')) {
+            strValue = strValue.slice(0, -1);
+        }
+        const parsed = parseInt(strValue, 10);
+        return Number.isNaN(parsed) ? null : parsed;
+    }
+
+    async function loadAnnotations() {
+        try {
+            const response = await fetch(`/pdf-viewer/api/pdfs/${id}/annotations/`, {
+                method: 'GET',
+                credentials: 'include',
+            });
+            if (!response.ok) {
+                throw new Error(`Failed to fetch annotations: ${response.status}`);
+            }
+
+            const payload = await response.json();
+            annotationsCache = payload.annotations ?? [];
+            currentHighlightColor = payload.editor_color;
+            
+            identifyMyAnnots(annotationsCache);
+
+            if (Object.prototype.hasOwnProperty.call(payload, 'current_user_id')) {
+                currentUserId = payload.current_user_id;
+            }
+            eventBus.dispatch('annotationincacheloaded', {
+                'loaded': true
+            });
+        } catch (error) {
+            console.error('Unable to load annotations', error);
+        }
+    }
+
+    // здесь надо засунуть в собственные аннотации
+    function registerAnnotation(annotation) {
+        if (!annotation) {
+            return;
+        }
+        currentJSEditor.annotationElementId = annotation.xref;
+
+        const targetXref = normalizeAnnotationIdentifier(annotation.xref ?? annotation.annotation_id);
+        const targetId = annotation.id ?? null;
+        const index = annotationsCache.findIndex((item) => {
+            const itemXref = normalizeAnnotationIdentifier(item.xref);
+            return (targetId && item.id === targetId) || (targetXref !== null && itemXref === targetXref);
+        });
+        if (index >= 0) {
+            annotationsCache[index] = annotation;
+        } else {
+            annotationsCache.push(annotation);
+        }
+        identifyMyAnnots([annotation]);
+    }
+
+    function removeAnnotationFromCache(annotationIdentifier) {
+        const normalized = normalizeAnnotationIdentifier(annotationIdentifier);
+        annotationsCache = annotationsCache.filter((item) => {
+            const sameId = item.id !== undefined && item.id === annotationIdentifier;
+            const sameXref = normalizeAnnotationIdentifier(item.xref) === normalized;
+            return !sameId && !sameXref;
+        });
+    }
+
+    function isMyAnnot(annotId) {
+        return !!(
+            myAnnotsCache?.find(a =>
+                normalizeAnnotationIdentifier(a?.xref) === normalizeAnnotationIdentifier(annotId)
+            )
+        )
+    }
+
+    // придумал что делать
+    // берём в шину firstSelectedEditor - ставим его четвёртым промисом
+    // здесь достаём эдитор по id и проверяем его на принадлежность автору
+    // как только это произошло - сразу же ебашим все остальные эдиторы в лупе
+    // могут возникнуть проблемы с эдитором, который толь-только был создан - там нет annot id
+    // надо сначала это исправить
+    function manageDeleteButtons() {
+        console.log('numofpages:', numOfDocPages);
+        for (let p = 0; p < numOfDocPages; p++) {
+            const editors = annotationUIManager.getEditors(p);
+            console.log('SSSSSSSSS', editors)
+            for (editor of editors) {
+                console.log('PAGEEDITOR', editor);
+            }
+        }
+    }
+
+    function setupIdentifyMyManagersCondition() {
+        // кондиции загрузки страниц, загрузки аннотаций, инициализации менеджера   
+        return Promise.all([
+
+            // Событие готовности аннотаций
+            new Promise(resolve => {
+                eventBus.on('annotationincacheloaded', (data) => {
+                    console.log('annotationincacheloaded received:', data);
+                    resolve(data);
+                });
+            }),
+        ])
+    }
+
+    function identifyMyManagers(editor) {
+        if (isMyAnnot(normalizeAnnotationIdentifier(editor.annotationElementId))) {
+            myUIManagersCache.push(editor);
+            console.log('мой эдитор', editor);
+            outlineMyAnnot(editor);
+        }
+    }
+
+    function isMyManager(managerId) {
+        console.log('managerId', managerId);
+        return !!(
+            myUIManagersCache?.find(m =>
+                m?.id === managerId
+            )
+        )
+    }
+
+    // внмиание на pointerover pointerleave в pdf.mjs
+    function outlineMyAnnot(e) {
+        console.log("рисуночк", e.parent?.drawLayer);
+        // будем делать через эдиторы
+    }
+
+    // проверка собственности должна быть в сетапе
+    async function setupCurrentToolbar(editor) {
+        let managerDiv = editor.div;
+        let toolBar = await waitForToolbarInDiv(managerDiv).then((tb) => {
+            if (window.AUTH_USER_ID) {
+                if (isMyManager(editor.id) === false) {
+                    removeDeleteButton(tb);
+                } else {
+                    let delButton = tb.querySelector('.buttons > .delete');
+                    delButton.addEventListener('click', deleteAnnotation);
+                }
+                addToolbarButton(tb, 'comment');
+            }
+        });
+        // сюда можно добавить ссылку на профиль автора
+    }
+
+    function removeDeleteButton(toolbarDiv) {
+        let delButton = toolbarDiv.querySelector('.buttons > .delete');
+        delButton?.remove();
+    }
+
+    // здесь надо ждать не конкретную кнопку, а сам тулбар. и удалять \ добавлять кнопки
+    function waitForToolbarInDiv(divElement, selector = '.editToolbar') {
+        return new Promise((resolve, reject) => {
+            // Проверяем, есть ли кнопка уже сейчас
+            const existingBar = divElement.querySelector(selector);
+            if (existingBar) {
+                resolve(existingBar);
+                return;
+            }
+            
+            // Создаем наблюдатель
+            const observer = new MutationObserver(() => {
+                const bar = divElement.querySelector(selector);
+                if (bar) {
+                    observer.disconnect(); // останавливаем наблюдение
+                    resolve(bar); // возвращаем найденный бар
+                }
+            });
+            
+            // Начинаем наблюдение
+            observer.observe(divElement, {
+                childList: true,
+                subtree: true
+            });
+            
+            // Возвращаем функцию для отмены наблюдения при необходимости
+            return () => observer.disconnect();
+        });
+    }
+
+    let id = 4; // для теста
+    const viewer = document.getElementById("viewer");
+    const scaleInput = document.getElementById("scaleInput");
+    const pageNum = document.getElementById("pageNum");
+    const pageCount = document.getElementById("pageCount");
+    const zoomInBtn = document.getElementById("zoomIn");
+    const zoomOutBtn = document.getElementById("zoomOut");
+    pageCount.textContent = "Loading...";
+    scaleInput.setAttribute("max", `${MAX_SCALE * 100}`);
+    scaleInput.setAttribute("min", `${MIN_SCALE * 100}`);
+    
+    function normalizePageInput () {
+        if ((!pagesInitEvent) || (!pdfLinkService)) return;
+
+        let value = parseInt(pageNum.value);
+        const min = 1;
+        const max = parseInt(pageCount.innerText);
+        if (value < min) {
+            value = min;
+        } else if (value > max) {
+            value = max;
+        }
+
+        pageNum.value = value;
+        pdfLinkService.goToPage(value);
+        //console.log("after", pdfViewer._currentPageNumber);
+    }
+    pageNum.addEventListener("blur", normalizePageInput);
+
+    function normalizeScaleInput() {
+        let value = parseInt(scaleInput.value);
+        const min = parseFloat(scaleInput.min);
+        const max = parseFloat(scaleInput.max);
+        if (value < min) {
+            value = min;
+        } else if (value > max) {
+            value = max;
+        }
+        scaleInput.value = value;
+        changeScale();
+    }    
+    scaleInput.addEventListener("blur", normalizeScaleInput);
+
+    function changeScale() {
+        if (!pdfViewer) return;
+
+        let value = parseFloat(scaleInput.value);
+        let previousScale = sessionStorage.getItem("previousScale");
+
+        let containerRect = document.getElementById('viewer').getBoundingClientRect();
+        let origin = { x: containerRect.left, y: containerRect.top };
+
+        let scaleFactor = previousScale ? value / previousScale : value / 100;
+
+        pdfViewer.updateScale({
+            scaleFactor: scaleFactor,
+            origin: origin,
+        });
+
+        if (pdfViewer._currentScale === MAX_SCALE || pdfViewer._currentScale === MIN_SCALE) {
+            pdfViewer._currentScale === MAX_SCALE ? zoomInBtn.disabled = true : zoomOutBtn.disabled = true;
+        } else {
+            zoomInBtn.disabled = false;
+            zoomOutBtn.disabled = false;
+        }
+
+        sessionStorage.setItem("previousScale", scaleInput.value);
+    }
+
+    function zoomInFun() {
+        scaleInput.value = `${parseFloat(scaleInput.value) + (DEFAULT_SCALE_DELTA - 1) * 100}`;
+        normalizeScaleInput();    
+    }
+
+    function zoomOutFun() {
+        scaleInput.value = `${parseFloat(scaleInput.value) - (DEFAULT_SCALE_DELTA - 1) * 100}`;
+        normalizeScaleInput();
+    }
+
+    zoomInBtn.addEventListener('click', zoomInFun);
+    zoomOutBtn.addEventListener('click', zoomOutFun);
+    // enableTextSelection() (и сестрица этой функции) - использовать при выборе режима хайлайта / его отключении
+
+    // ЗАДАЧИ:
+    // сделать комментарии
+    // обводку для собственных аннотаций (я хуй забил)
+    // Х ГОТОВО цвет аннотаций
+    // зум на клавишах
+    // Х ГОТОВО исправить!!! с selection.empty() или как-то так ничего не работает. пока что бибилиотека изменена (чекнуть getSelectionBoxes)
+    // отделить открытие эдитора для создания аннотации и открытие для просмотра
+    // удаление в той же сессии, что и добавление
+    // добавить логику static deleteAnnotationElement(editor)
+    // Х ГОТОВО кнопки удаления через load (так полностью сделать нельзя, но вроде как максимально хорошо сделал)
+
+    // оптимизировать
+
+    function identifyMyAnnots(cache) {
+
+        cache.forEach(annot => {
+            if (annot.is_author) {
+                myAnnotsCache.push(annot);
+                console.log('myAnnot', annot);
+                outlineMyAnnot(annot.xref);
+            }
+        })
+    }
+
+    async function addHighlight(quadpoints) {
+
+        let viewport = null;
+        let pageIndex = currentJSEditor.pageIndex;
+        let normalizedRects = [];
+
+        // Найдём DOM-страницу под выделением и возьмём её рамку
+        let pageDom = document.querySelector(`[data-page-number="${pageIndex + 1}"]`);
+        let textLayerRect = pageDom.querySelector('.textLayer').getBoundingClientRect();
+
+        const page = await pdfDoc.getPage(pageIndex + 1);
+        const { scale, rotation } = pdfViewer.getPageView(pageIndex).viewport;
+        viewport = page.getViewport({ scale: 1, rotation, dontFlip: false});
+        
+        // quad-test
+        for (let i = 0; i < quadpoints.length; i += 8) {
+            const point1 = viewport.convertToPdfPoint(quadpoints[i], quadpoints[i+1]);
+            const point2 = viewport.convertToPdfPoint(quadpoints[i+2], quadpoints[i+3]);
+            const point3 = viewport.convertToPdfPoint(quadpoints[i+4], quadpoints[i+5]);
+            const point4 = viewport.convertToPdfPoint(quadpoints[i+6], quadpoints[i+7]);
+            
+            // Записываем обратно в quadpoints
+            quadpoints[i] = point1[0];   quadpoints[i+1] = point1[1];
+            quadpoints[i+2] = point2[0]; quadpoints[i+3] = point2[1];
+            quadpoints[i+4] = point3[0]; quadpoints[i+5] = point3[1];
+            quadpoints[i+6] = point4[0]; quadpoints[i+7] = point4[1];
+        }          
+        normalizedRects = quadpoints;
+
+        fetch(`/pdf-viewer/api/pdfs/${id}/add_annotation/`, {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': getCSRFToken(),
+            },
+            body: JSON.stringify({
+                'page': pageIndex,
+                'quadpoints': normalizedRects,
+                'divheight': textLayerRect.height,
+            }),
+        })
+            .then((response) => {
+                if (!response.ok) {
+                    if (response.status === 403) {
+                        throw new Error('Требуется авторизация для создания аннотаций');
+                    }
+                    throw new Error(`HTTP error in highlight-adding! status: ${response.status}`);
+                }
+                return response.json();
+            })
+            .then((result) => {
+                if (!result) {
+                    return;
+                }
+                if (Object.prototype.hasOwnProperty.call(result, 'current_user_id')) {
+                    currentUserId = result.current_user_id;
+                }
+                if (result.annotation) {
+                    if (!Object.prototype.hasOwnProperty.call(result.annotation, 'is_author')) {
+                        result.annotation.is_author = true;
+                    }
+                    registerAnnotation(result.annotation);
+                }
+                console.log('highlight have been added');
+            })
+            .catch((error) => {
+                console.error('Failed to add annotation', error);
+            });
+    }
+
+    function addComment() {
+        fetch('api/pdf', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ 
+                'rect_obj': rectSelectionObj,
+                'reply': 'False',
+            }),
+        }).then((response) => {
+            if (!response.ok) {
+                throw new Error(`HTTP error in comment-adding! status: ${response.status}`);
+            } else {
+                console.log('comment have been added');
+
+            }
+        });
+    }
+
+    function deleteAnnotation() {
+
+        const annotId = currentJSEditor.annotationElementId;
+        console.log('annotid', annotId);
+        pageIndex = currentJSEditor.pageIndex;
+
+        fetch(`/pdf-viewer/api/pdfs/${id}/delete_annotation/`, {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': getCSRFToken(),
+            },
+            body: JSON.stringify({
+                'page': pageIndex,
+                'annotation_id': annotId,
+            }),
+        })
+        .then((response) => {
+                if (!response.ok) {
+                    if (response.status === 403) {
+                        throw new Error('У вас нет прав удалять эту аннотацию');
+                    }
+                    return response.json()
+                        .then((data) => {
+                            throw new Error(data?.message ?? `HTTP error in highlight-deleting! status: ${response.status}`);
+                        })
+                        .catch(() => {
+                            throw new Error(`HTTP error in highlight-deleting! status: ${response.status}`);
+                        });
+                }
+                return response.json();
+            })
+            .then((result) => {
+                if (!result) {
+                    console.log('нет result');
+                    return;
+                }
+                if (Object.prototype.hasOwnProperty.call(result, 'current_user_id')) {
+                    currentUserId = result.current_user_id;
+                }
+                if (result.annotation) {
+                    removeAnnotationFromCache(result.annotation.id ?? result.annotation.xref ?? annotId);
+                    console.log('deleted from back');
+                } else {
+                    removeAnnotationFromCache(annotId);
+                    console.log('deleted from front');
+                }
+            })
+            .catch((error) => {
+                console.error('Failed to delete annotation', error);
+            });
+    }
+
+    function addToolbarButton(toolbarDiv, buttonName) {
+
+        if (toolbarDiv.querySelector('.buttons > .comment')) {
+            return
+        }
+
+        let button = document.createElement('button');
+        button.setAttribute('class', `${buttonName}`);
+        button.setAttribute('tabindex', 0);
+        
+        toolbarDiv.querySelector('.buttons').appendChild(button);
+        button.insertAdjacentHTML('afterend', '<div class="divider"></div>');
+    }
+
+    // нужно это в завернуть в постоянную проверку и не ебаться с лишней переменной 
+    // commentAnnotationButton.addEventListener('click', () => {
+    //     console.log('коммент нажат');
+    // })
+
+    async function afterEditorOpenned() {
+        
+        currentJSEditor = annotationUIManager.firstSelectedEditor;
+
+        await setupCurrentToolbar(currentJSEditor);
+
+        if (window.AUTH_USER_ID) {
+            let quadPoints = currentJSEditor.serialize()?.quadPoints;
+
+            if (quadPoints) {
+                currentJSEditor.updateParams(31, currentHighlightColor);
+                await addHighlight(quadPoints);
+            }                                    
+        }
+    }
+
+    // Загружаем PDF
+
+    fetch(`/pdf-viewer/api/pdfs/${id}/get_pdf/`).then((response) => {
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        response.arrayBuffer().then((data) => {
+            const loadingTask = pdfjsLib.getDocument({
+                data: data
+            });
+
+            loadingTask.promise.then(async (pdfDocument) => {
+                eventBus = new pdfjsViewer.EventBus();
+
+                pdfViewer = new pdfjsViewer.PDFViewer({
+                    container: document.getElementById('documentContainer'),
+                    viewer: document.getElementById('viewer'),
+                    eventBus,
+                    textLayerMode: 1, // ENABLE
+                    annotationMode: 1, // ENABLE
+                    annotationEditorHighlightColors: "red=#ff0000, green=#00ff00, blue=#0000ff",
+                });
+
+                renderingQueue = pdfViewer.renderingQueue;
+                console.log(renderingQueue);
+
+                let myManagersCondition = setupIdentifyMyManagersCondition();
+
+                pdfLinkService = new pdfjsViewer.PDFLinkService({eventBus: eventBus});
+                pdfLinkService.setDocument(pdfDocument); // здесь все основные dispatch
+                pdfLinkService.setViewer(pdfViewer);
+
+                eventBus.on("pagesloaded", (e) => {
+                    //console.log('загрузка');
+                    pagesLoadEvent = true;
+                    numOfDocPages = e.pagesCount;
+                    pageCount.textContent = e.pagesCount;
+                })
+
+                eventBus.on("pagesinit", (viewer) => {
+                    pagesInitEvent = true;
+                })
+
+                eventBus.on("pagechanging", async (pages) => {
+                    let currentPage = pages.pageNumber
+                    pageNum.value = currentPage; // на малых масштабах работает криво
+                    // await identifyMyManagers(++currentPage);
+                    console.log('ну блять не будет меняться на первой');
+                })
+
+                // viewer.setDocument -> uiManager
+                // viewer.setDocument -> PDFPageView.draw() -> annotationLayer
+                // viewer.setDocument -> PDFPageView.draw() -> annotationEditorLayer
+                // тут же и textLayer кстати
+
+                eventBus.on("annotationeditoruimanager", (manager) => {
+                    annotationUIManager = manager.uiManager;
+                    annotationUIManager.updateMode(pdfjsLib.AnnotationEditorType.HIGHLIGHT);
+                    //console.log(annotationUIManager.getActive());
+
+                    // EditorToolbar.addButton(name, tool). name is fixed (switch). tool depends on fuction.
+                    // EditorToolbar <- addToolBar() <- select() <- [ class AnnotationEditor ] <- #selectEditors()
+                })                
+
+                eventBus.on("annotationeditorstateschanged", async (d) => {
+                    // здесь логируется сам факт открытия\закрытия эдитора'. переключение между ними не учитывается
+                })
+
+                eventBus.on("annotationeditorparamschanged", async (d) => {
+                    if (d.details[2]?.[1] === false) {
+                        await afterEditorOpenned();
+                    }
+                })
+
+                //  eventBus.on("pagerendered", (d) => {
+                //     console.log(annotationUIManager?.getEditors(d.pageNumber-1));
+                //  })
+
+                //eventBus.on("pagesinit", () => {
+                //    eventBus.on("annotationeditoruimanager", (manager) => {
+                //        annotationUIManager = manager.uiManager;
+                //        console.log("после инициализации страниц: ", annotationUIManager);
+                        //annotationUIManager.updateMode(pdfjsLib.AnnotationType.HIGHLIGHT);
+                        //console.log(annotationUIManager.getActive());
+
+                        // EditorToolbar.addButton(name, tool). name is fixed (switch). tool depends on fuction.
+                        // EditorToolbar <- addToolBar() <- select() <- [ class AnnotationEditor ] <- #selectEditors()
+                //    })
+                //})
+
+                pdfViewer.setDocument(pdfDocument);
+                pdfDoc = pdfDocument;
+                loadAnnotations();
+
+                // точка разделения для дальнейшей логики
+                const initializationComplete = Promise.resolve({
+                    pdfDocument,
+                    eventBus, 
+                    pdfViewer,
+                    pdfDoc
+                });
+
+                await Promise.all([
+                    // цепочка для кнопок удаления
+                    initializationComplete.then(async () => {
+                        await myManagersCondition.then(() => {
+                            eventBus.on("reporttelemetry", (d) => {
+                                const editor = d.source;
+                                if (editor && editor.constructor.name === "HighlightEditor") {
+                                    identifyMyManagers(editor);
+                                }
+                            })
+                            // конечно надо on поставить сразу после появления шины
+                        })
+                    }),
+                                    
+                    // следующие цепочки...
+                    // initializationComplete.then(async () => {
+                    // })
+                ]);
+            });
+        })
+    })
+
+    function getCSRFToken() {
+    const name = 'csrftoken';
+    const cookieValue = document.cookie
+        .split('; ')
+        .find(row => row.startsWith(name + '='))
+        ?.split('=')[1];
+    return cookieValue || '';
+}
+
+</script>
+
+<script>
+    window.AUTH_USER_ID = {{ request.user.id|default:"null" }};
+    window.AUTH_USER_NAME = "{{ request.user.username|default:'' }}";
+</script>
+
+</body>
+
+</html>
